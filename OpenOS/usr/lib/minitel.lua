@@ -14,6 +14,7 @@ for k,v in pairs(computer.getDeviceInfo()) do
 end
 
 local dgramQueues = setmetatable({},{__mode="v"})
+local waitingAcks = setmetatable({},{__mode="v"})
 
 local function dgramListener(_,from,port,data)
  local shouldNotify = false
@@ -71,7 +72,18 @@ local function onNextDgram(queue, f)
  end
 end
 
+local function ackListener(_,rpid)
+ local entry = waitingAcks[rpid]
+ if not entry then
+  return
+ end
+ entry.received = true
+ -- wake the waiting thread up
+ event.push("dummy")
+end
+
 event.listen("net_msg",dgramListener)
+event.listen("net_ack",ackListener)
 
 function net.genPacketID()
  local npID = ""
@@ -87,12 +99,21 @@ end
 
 function net.rsend(to,port,data,block)
  local pid, stime = net.genPacketID(), computer.uptime() + net.streamdelay
+ local ackRef = {}
+ if not block then
+  waitingAcks[pid] = ackRef
+ end
  computer.pushSignal("net_send",1,to,port,data,pid)
  if block then return pid end
  repeat
-  _,rpid = event.pull(0.5,"net_ack")
- until rpid == pid or computer.uptime() > stime
- if not rpid then return false end
+  local _,rpid = event.pull(0.5,"net_ack")
+  if rpid == pid then
+   ackRef.received = true
+   break
+  end
+ until ackRef.received or computer.uptime() > stime
+ waitingAcks[pid] = nil
+ if not ackRef.received then return false end
  return true
 end
 
