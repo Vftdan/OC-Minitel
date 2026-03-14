@@ -13,6 +13,66 @@ for k,v in pairs(computer.getDeviceInfo()) do
  end
 end
 
+local dgramQueues = setmetatable({},{__mode="v"})
+
+local function dgramListener(_,from,port,data)
+ local shouldNotify = false
+ local portQueues = dgramQueues[port]
+ if type(portQueues) ~= "table" then
+  return
+ end
+ for queue,active in pairs(portQueues) do
+  if type(queue) == "table" and active and (queue.addr == nil or queue.addr == from) then
+   if #queue == 0 then
+    shouldNotify = true
+   end
+   queue[#queue+1] = {addr=from,data=data}
+   if type(queue.nextCb) == "function" then
+    pcall(queue.nextCb,table.remove(queue,1))
+    queue.nextCb = nil
+   end
+  end
+ end
+ -- wake waiting threads up
+ if shouldNotify then
+  event.push("dummy")
+ end
+end
+
+local function listenDgrams(addr,port)
+ local queue = {addr=addr,port=port}
+ local portQueues = dgramQueues[port]
+ if type(portQueues) ~= "table" then
+  portQueues = setmetatable({},{__mode="k"})
+  dgramQueues[port] = portQueues
+ end
+ queue.backref = portQueues
+ portQueues[queue] = true
+ return queue
+end
+
+local function unlistenDgrams(queue)
+ local portQueues = dgramQueues[queue.port]
+ portQueues[queue] = nil
+ for otherQueue in pairs(portQueues) do
+  if type(otherQueue) == "table" then
+   return
+  end
+ end
+ dgramQueues[queue.port] = nil
+end
+
+local function onNextDgram(queue, f)
+ if #queue == 0 then
+  queue.nextCb = f
+ else
+  pcall(f,table.remove(queue,1))
+  event.push("dummy")
+ end
+end
+
+event.listen("net_msg",dgramListener)
+
 function net.genPacketID()
  local npID = ""
  for i = 1, 16 do
@@ -91,7 +151,7 @@ local function socket(addr,port,sclose)
  conn.read = cread
  conn.state = "open"
  conn.sclose = sclose
- local function listener(_,f,p,d)
+ function conn.listener(_,f,p,d)
   if f == conn.addr and p == conn.port then
    if d == sclose then
     conn:close()
@@ -100,9 +160,9 @@ local function socket(addr,port,sclose)
    end
   end
  end
- event.listen("net_msg",listener)
+ event.listen("net_msg",conn.listener)
  function conn.close(self)
-  event.ignore("net_msg",listener)
+  event.ignore("net_msg",conn.listener)
   conn.state = "closed"
   net.rsend(addr,port,sclose)
  end
@@ -110,41 +170,78 @@ local function socket(addr,port,sclose)
 end
 
 function net.open(to,port)
- if not net.rsend(to,port,"openstream") then return false, "no ack from host" end
+ local queue = listenDgrams(to,port)
+ if not net.rsend(to,port,"openstream") then
+  unlistenDgrams(queue)
+  return false, "no ack from host"
+ end
  local st = computer.uptime()+net.streamdelay
  local est = false
- while true do
-  _,from,rport,data = event.pull(net.streamdelay, "net_msg")
-  if to == from and rport == port then
+ local data = nil
+ local estQueue = nil
+ local function portCb(msg)
+  if msg.data ~= "openstream" then
+   data = msg.data
    if tonumber(data) then
     est = true
+    data = tonumber(data)
+    estQueue = listenDgrams(to,data)
    end
-   break
-  end
-  if st < computer.uptime() then
-   return nil, "timed out"
   end
  end
+ while not data and st >= computer.uptime() do
+  onNextDgram(queue, portCb)
+  if data then
+   break
+  end
+  event.pull(net.streamdelay)
+ end
+ if not data then
+  unlistenDgrams(queue)
+  return nil, "timed out"
+ end
+ unlistenDgrams(queue)
  if not est then
   return nil, "refused"
  end
- data = tonumber(data)
- sclose = ""
- repeat
-  _,from,nport,sclose = event.pull("net_msg")
- until from == to and nport == data
- return socket(to,data,sclose)
+ local conn = nil
+ local function scloseCb(msg)
+  local sclose = msg.data
+  conn = socket(to,data,sclose)
+  while #estQueue > 0 and conn.state == "open" do
+   conn.listener("net_msg",to,data,table.remove(estQueue,1).data)
+  end
+ end
+ while not conn and st >= computer.uptime() do
+  onNextDgram(estQueue, scloseCb)
+  if conn then
+   break
+  end
+  event.pull(net.streamdelay)
+ end
+ unlistenDgrams(estQueue)
+ if not conn then
+  return nil, "timed out"
+ end
+ return conn
 end
 
 function net.listen(port)
+ local queue = listenDgrams(nil,port)
+ local from = nil
  repeat
-  _, from, rport, data = event.pull("net_msg")
- until rport == port and data == "openstream"
+  event.pull()
+  local msg = table.remove(queue,1)
+  if msg and msg.data == "openstream" then
+   from = msg.from
+  end
+ until from ~= nil
+ local conn = socket(from,nport,sclose)  -- TODO stop listening on garabage-collected sockets
  local nport = math.random(net.minport,net.maxport)
  local sclose = net.genPacketID()
  net.rsend(from,rport,tostring(nport))
  net.rsend(from,nport,sclose)
- return socket(from,nport,sclose)
+ return conn
 end
 
 function net.flisten(port,listener)
