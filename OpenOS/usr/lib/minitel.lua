@@ -151,13 +151,17 @@ local function socket(addr,port,sclose)
  conn.read = cread
  conn.state = "open"
  conn.sclose = sclose
+ local first = true
  function conn.listener(_,f,p,d)
   if f == conn.addr and p == conn.port then
    if d == sclose then
-    conn:close()
+    if not first then
+     conn:close()
+    end
    else
     conn.rbuffer = conn.rbuffer .. d
    end
+   first = false
   end
  end
  event.listen("net_msg",conn.listener)
