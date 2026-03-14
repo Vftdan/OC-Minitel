@@ -266,8 +266,8 @@ function start()
  local function queuePacket(_,ptype,to,vPort,data,npID)
   npID = npID or genPacketID()
   if to == hostname or to == "localhost" then
-   computer.pushSignal("net_msg",to,vPort,data)
    computer.pushSignal("net_ack",npID)
+   computer.pushSignal("net_msg",to,vPort,data)
    return
   end
   pqueue[npID] = {ptype,to,vPort,data,0,0}
