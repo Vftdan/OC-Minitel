@@ -52,12 +52,33 @@ end
 
 -- socket stuff, layer 5?
 
+local hostname = computer.address():sub(1,8)
+do
+ local f=io.open("/etc/hostname","rb")
+ if f then
+  hostname = f:read()
+  f:close()
+ end
+end
+
+local loopbackAccepted = setmetatable({},{__mode="v"})
+
+local function isLoopbackAddr(addr)
+ return addr == hostname or addr == "localhost"
+end
+
 local function cwrite(self,data)
  if self.state == "open" then
   if not net.send(self.addr,self.port,data) then
    self:close()
    return false, "timed out"
   end
+ end
+end
+local function fdxwrite(self,data)
+ if self.state == "open" then
+  self.other.rbuffer = self.other.rbuffer .. data
+  computer.pushSignal("loopback_write")  -- wake the reading thread up
  end
 end
 local function cread(self,length)
@@ -81,6 +102,10 @@ local function cread(self,length)
    return nil
   end
  end
+end
+local function fdxclose(self)
+ self.state = "closed"
+ self.other.state = "closed"
 end
 
 local function socket(addr,port,sclose)
@@ -109,7 +134,36 @@ local function socket(addr,port,sclose)
  return conn
 end
 
+local function socketpair()
+ local up, down = {}, {}
+ up.other = down
+ down.other = up
+ for _, conn in ipairs{up, down} do
+  conn.rbuffer = ""
+  conn.write = fdxwrite
+  conn.read = cread
+  conn.state = "open"
+  conn.close = fdxclose
+ end
+ return up, down
+end
+
 function net.open(to,port)
+ if isLoopbackAddr(to) then
+  local st = computer.uptime()+net.streamdelay
+  computer.pushSignal("loopback_connect",to,port)
+  while true do
+   for i, conn in ipairs(loopbackAccepted[port] or {}) do
+    if conn.addr == to then
+     return table.remove(loopbackAccepted[port], i)
+    end
+   end
+   event.pull()
+   if st < computer.uptime() then
+    return nil, "timed out"
+   end
+  end
+ end
  if not net.rsend(to,port,"openstream") then return false, "no ack from host" end
  local st = computer.uptime()+net.streamdelay
  local est = false
@@ -137,9 +191,20 @@ function net.open(to,port)
 end
 
 function net.listen(port)
+ local loopbackQueue = loopbackAccepted[port] or {}
+ loopbackAccepted[port] = loopbackQueue
+ local e, from, rport, data
  repeat
-  _, from, rport, data = event.pull("net_msg")
- until rport == port and data == "openstream"
+  e, from, rport, data = event.pullMultiple("net_msg", "loopback_connect")
+ until rport == port and (e == "net_msg" and data == "openstream" or e == "loopback_connect")
+ if e == "loopback_connect" then
+  local connServer, connClient = socketpair()
+  connServer.addr = from
+  connClient.addr = from
+  loopbackQueue[#loopbackQueue + 1] = connClient
+  computer.pushSignal("loopback_accept",from,port)
+  return connServer
+ end
  local nport = math.random(net.minport,net.maxport)
  local sclose = net.genPacketID()
  net.rsend(from,rport,tostring(nport))
@@ -148,17 +213,34 @@ function net.listen(port)
 end
 
 function net.flisten(port,listener)
- local function helper(_,from,rport,data)
-  if rport == port and data == "openstream" then
-   local nport = math.random(net.minport,net.maxport)
-   local sclose = net.genPacketID()
-   net.rsend(from,rport,tostring(nport))
-   net.rsend(from,nport,sclose)
-   listener(socket(from,nport,sclose))
+ local loopbackQueue = loopbackAccepted[port] or {}
+ loopbackAccepted[port] = loopbackQueue
+ local function helper(e,from,rport,data)
+  if e == "net_msg" then
+   if rport == port and data == "openstream" then
+    local nport = math.random(net.minport,net.maxport)
+    local sclose = net.genPacketID()
+    net.rsend(from,rport,tostring(nport))
+    net.rsend(from,nport,sclose)
+    listener(socket(from,nport,sclose))
+   end
+  elseif e == "loopback_connect" and rport == port then
+   local connServer, connClient = socketpair()
+   connServer.addr = from
+   connClient.addr = from
+   loopbackQueue[#loopbackQueue + 1] = connClient
+   computer.pushSignal("loopback_accept",from,port)
+   listener(connServer)
   end
  end
  event.listen("net_msg",helper)
+ event.listen("loopback_connect",helper)
  return helper
+end
+
+function net.ignore(helper)
+ event.ignore("net_msg",helper)
+ event.ignore("loopback_connect",helper)
 end
 
 return net
