@@ -62,7 +62,8 @@ do
  end
 end
 
-local loopbackAccepted = setmetatable({},{__mode="v"})
+local loopbackListening = setmetatable({},{__mode="v"})
+local listenerInfo = setmetatable({},{__mode="k"})
 
 local function isLoopbackAddr(addr)
  return addr == hostname or addr == "localhost"
@@ -102,19 +103,16 @@ end
 
 function net.open(to,port)
  if isLoopbackAddr(to) then
-  local st = computer.uptime()+net.streamdelay
-  computer.pushSignal("loopback_connect",to,port)
-  while true do
-   for i, conn in ipairs(loopbackAccepted[port] or {}) do
-    if conn.addr == to then
-     return table.remove(loopbackAccepted[port], i)
-    end
-   end
-   event.pull()
-   if st < computer.uptime() then
-    return nil, "timed out"
-   end
+  local tbl = loopbackListening[port]
+  if not tbl then
+   return nil, "not listening"
   end
+  local conn, reason = tbl.connect("a")
+  if not conn then
+   return nil, reason
+  end
+  conn.addr = to
+  return conn
  end
  if not net.rsend(to,port,"openstream") then return false, "no ack from host" end
  local st = computer.uptime()+net.streamdelay
@@ -142,57 +140,71 @@ function net.open(to,port)
  return socket(to,data,sclose)
 end
 
-function net.listen(port)
- local loopbackQueue = loopbackAccepted[port] or {}
- loopbackAccepted[port] = loopbackQueue
- local e, from, rport, data
- repeat
-  e, from, rport, data = event.pullMultiple("net_msg", "loopback_connect")
- until rport == port and (e == "net_msg" and data == "openstream" or e == "loopback_connect")
- if e == "loopback_connect" then
-  local connServer, connClient = syssocket.socketpair()
-  connServer.addr = from
-  connClient.addr = from
-  loopbackQueue[#loopbackQueue + 1] = connClient
-  computer.pushSignal("loopback_accept",from,port)
-  return connServer
+local function registerListening(port,tbl,ssocket)
+ loopbackListening[port] = tbl
+ local function helper(_,from,rport,data)
+  if rport == port and data == "openstream" then
+   local nport = math.random(net.minport,net.maxport)
+   local sclose = net.genPacketID()
+   net.rsend(from,rport,tostring(nport))
+   net.rsend(from,nport,sclose)
+   tbl.upgrade(socket(from,nport,sclose))
+  end
  end
- local nport = math.random(net.minport,net.maxport)
- local sclose = net.genPacketID()
- net.rsend(from,rport,tostring(nport))
- net.rsend(from,nport,sclose)
- return socket(from,nport,sclose)
+ listenerInfo[helper] = {port,tbl,ssocket}
+ event.listen("net_msg",helper)
+ return helper
+end
+
+local function unregisterListening(helper)
+ local info = listenerInfo[helper]
+ if info then
+  local port,tbl,ssocket = info[1],info[2]
+  if loopbackListening[port] == tbl then
+   loopbackListening[port] = nil
+  end
+  listenerInfo[helper] = nil
+  tbl.close()
+  if ssocket then
+   ssocket:close()
+  end
+ end
+ event.ignore("net_msg",helper)
+end
+
+function net.listen(port)
+ local ssocket,tbl = syssocket.socketserver()
+ local helper = registerListening(port,tbl,ssocket)
+ local success,conn,reason = xpcall(ssocket.accept,debug.traceback,ssocket)
+ unregisterListening(helper)
+ ssocket:close()
+ if not success then
+  error(conn)
+ end
+ if not conn then
+  error(reason)
+ end
+ if not conn.addr then
+  conn.addr = "localhost"
+ end
+ return conn
 end
 
 function net.flisten(port,listener)
- local loopbackQueue = loopbackAccepted[port] or {}
- loopbackAccepted[port] = loopbackQueue
- local function helper(e,from,rport,data)
-  if e == "net_msg" then
-   if rport == port and data == "openstream" then
-    local nport = math.random(net.minport,net.maxport)
-    local sclose = net.genPacketID()
-    net.rsend(from,rport,tostring(nport))
-    net.rsend(from,nport,sclose)
-    listener(socket(from,nport,sclose))
-   end
-  elseif e == "loopback_connect" and rport == port then
-   local connServer, connClient = syssocket.socketpair()
-   connServer.addr = from
-   connClient.addr = from
-   loopbackQueue[#loopbackQueue + 1] = connClient
-   computer.pushSignal("loopback_accept",from,port)
-   listener(connServer)
+ local ssocket,tbl = syssocket.socketserver()
+ local helper = registerListening(port,tbl,ssocket)
+ ssocket.onConnect = function(conn)
+  if not conn.addr then
+   conn.addr = "localhost"
   end
+  listener(conn)
  end
- event.listen("net_msg",helper)
- event.listen("loopback_connect",helper)
+ ssocket:startDaemon()
  return helper
 end
 
 function net.ignore(helper)
- event.ignore("net_msg",helper)
- event.ignore("loopback_connect",helper)
+ unregisterListening(helper)
 end
 
 return net
