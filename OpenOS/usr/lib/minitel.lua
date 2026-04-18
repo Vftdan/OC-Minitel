@@ -1,5 +1,6 @@
 local computer = require "computer"
 local event = require "event"
+local syssocket = require "sys.socket"
 local net = {}
 net.mtu = 8192
 net.streamdelay = 30
@@ -67,7 +68,7 @@ local function isLoopbackAddr(addr)
  return addr == hostname or addr == "localhost"
 end
 
-local function cwrite(self,data)
+local function csend(self,data)
  if self.state == "open" then
   if not net.send(self.addr,self.port,data) then
    self:close()
@@ -75,77 +76,28 @@ local function cwrite(self,data)
   end
  end
 end
-local function fdxwrite(self,data)
- if self.state == "open" then
-  self.other.rbuffer = self.other.rbuffer .. data
-  computer.pushSignal("loopback_write")  -- wake the reading thread up
- end
-end
-local function cread(self,length)
- length = length or "\n"
- local rdata = ""
- if type(length) == "number" then
-  rdata = self.rbuffer:sub(1,length)
-  self.rbuffer = self.rbuffer:sub(length+1)
-  return rdata
- elseif type(length) == "string" then
-  if length:sub(1,2) == "*a" then
-   rdata = self.rbuffer
-   self.rbuffer = ""
-   return rdata
-  elseif length:len() == 1 then
-   local pre, post = self.rbuffer:match("(.-)"..length.."(.*)")
-   if pre and post then
-    self.rbuffer = post
-    return pre
-   end
-   return nil
-  end
- end
-end
-local function fdxclose(self)
- self.state = "closed"
- self.other.state = "closed"
-end
 
 local function socket(addr,port,sclose)
- local conn = {}
+ local conn, recvfwd = syssocket.socketpair()
  conn.addr,conn.port = addr,tonumber(port)
- conn.rbuffer = ""
- conn.write = cwrite
- conn.read = cread
- conn.state = "open"
+ conn.send = csend
  conn.sclose = sclose
  local function listener(_,f,p,d)
   if f == conn.addr and p == conn.port then
    if d == sclose then
-    conn:close()
+    recvfwd:close()
    else
-    conn.rbuffer = conn.rbuffer .. d
+    recvfwd:send(d)
    end
   end
  end
  event.listen("net_msg",listener)
  function conn.close(self)
   event.ignore("net_msg",listener)
-  conn.state = "closed"
+  conn:shutdown()
   net.rsend(addr,port,sclose)
  end
  return conn
-end
-
-local function socketpair()
- local up, down = {}, {}
- up.other = down
- down.other = up
- for _, conn in ipairs{up, down} do
-  conn.rbuffer = ""
-  conn.write = fdxwrite
-  conn.read = cread
-  conn.state = "open"
-  conn.close = fdxclose
- end
- return up, down
 end
 
 function net.open(to,port)
@@ -198,7 +150,7 @@ function net.listen(port)
   e, from, rport, data = event.pullMultiple("net_msg", "loopback_connect")
  until rport == port and (e == "net_msg" and data == "openstream" or e == "loopback_connect")
  if e == "loopback_connect" then
-  local connServer, connClient = socketpair()
+  local connServer, connClient = syssocket.socketpair()
   connServer.addr = from
   connClient.addr = from
   loopbackQueue[#loopbackQueue + 1] = connClient
@@ -225,7 +177,7 @@ function net.flisten(port,listener)
     listener(socket(from,nport,sclose))
    end
   elseif e == "loopback_connect" and rport == port then
-   local connServer, connClient = socketpair()
+   local connServer, connClient = syssocket.socketpair()
    connServer.addr = from
    connClient.addr = from
    loopbackQueue[#loopbackQueue + 1] = connClient
